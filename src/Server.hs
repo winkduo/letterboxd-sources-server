@@ -22,17 +22,20 @@ import Servant
 import Servant.Client (ClientEnv, ClientM, runClientM)
 import Servant.Server
 
-type API = "find_movie" :> QueryParam "name" T.Text :> Get '[ JSON] [Movie] -- GET /find_movie
+type API
+   = "find_movie" :> QueryParam "name" T.Text :> Get '[ JSON] (Headers '[ Header "Access-Control-Allow-Origin" String] [Movie]) -- GET /find_movie
 
 server :: Server API
 server = findMovie
   where
-    findMovie :: Maybe T.Text -> Handler [Movie]
-    findMovie Nothing = pure []
+    findMovie ::
+         Maybe T.Text
+      -> Handler (Headers '[ Header "Access-Control-Allow-Origin" String] [Movie])
+    findMovie Nothing = pure $ addHeader "*" []
     findMovie (Just movie_name) = do
       clientEnv <- liftIO getClientEnv
       indexers <- callChillInstitute clientEnv getIndexers
-      fmap mconcat $
+      fmap (addHeader "*" . mconcat) $
         for indexers $ \(Indexer iId _) -> do
           callChillInstitute clientEnv $ getMovies movie_name iId
 
