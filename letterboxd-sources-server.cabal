@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 880d63888cc9dd08a57e5872feca89ac28effe0ed47c42d3badef0f6e5a96b20
+-- hash: 6233c5609c5d446c7963370ed5f5b230cbe05bf17b270385cff53b721a3c3867
 
 name:           letterboxd-sources-server
 version:        0.1.0.0
@@ -30,7 +30,6 @@ library
       Client.ChillInstitute.API
       Client.ChillInstitute.Types
       Main
-      Movie
       Server
   other-modules:
       Paths_letterboxd_sources_server
@@ -56,7 +55,6 @@ executable letterboxd-sources-server-exe
   other-modules:
       Client.ChillInstitute.API
       Client.ChillInstitute.Types
-      Movie
       Server
       Paths_letterboxd_sources_server
   hs-source-dirs:
