@@ -3,7 +3,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module Movie where
+module Client.ChillInstitute.Types where
 
 import qualified Data.Aeson as JSON
 import qualified Data.Text as T
