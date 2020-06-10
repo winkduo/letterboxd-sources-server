@@ -22,21 +22,6 @@ description:         Please see the README on GitHub at <https://github.com/gith
 dependencies:
 - base >= 4.7 && < 5
 
-library:
-  source-dirs: src
-  dependencies:
-  - servant
-  - servant-server
-  - servant-client
-  - aeson
-  - text
-  - http-client
-  - http-client-tls
-  - warp
-  - wai-extra
-  - bytestring
-  - mtl
-
 executables:
   letterboxd-sources-server-exe:
     main:                Main.hs
@@ -46,7 +31,6 @@ executables:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
-    - letterboxd-sources-server
     - servant
     - servant-server
     - servant-client
@@ -58,3 +42,7 @@ executables:
     - wai-extra
     - bytestring
     - mtl
+    - http-api-data
+    - wai-cors
+    - wai
+    - aeson-casing
