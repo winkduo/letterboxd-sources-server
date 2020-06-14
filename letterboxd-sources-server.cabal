@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 7278dbbb6e098302254523677cf905280c31e2895a1c41ec4afe7b8422d768bf
+-- hash: e9401de9c1f60e6cfcd418efdaa4ff18bad34dce2e796b8684155e2c99c4d448
 
 name:           letterboxd-sources-server
 version:        0.1.0.0
@@ -28,10 +28,10 @@ source-repository head
 executable letterboxd-sources-server-exe
   main-is: Main.hs
   other-modules:
-      AppEnv
       Client.ChillInstitute.API
       Client.ChillInstitute.Types
       Client.PutIO.API
+      Client.PutIO.API.File
       Client.PutIO.Types
       Client.Util
       Server
@@ -47,9 +47,14 @@ executable letterboxd-sources-server-exe
     , http-api-data
     , http-client
     , http-client-tls
+    , http-types
+    , lens
+    , lifted-base
+    , monad-logger
     , mtl
     , servant
     , servant-client
+    , servant-client-core
     , servant-server
     , text
     , wai

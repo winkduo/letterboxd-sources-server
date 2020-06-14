@@ -46,3 +46,8 @@ executables:
     - wai-cors
     - wai
     - aeson-casing
+    - monad-logger
+    - servant-client-core
+    - http-types
+    - lens
+    - lifted-base
