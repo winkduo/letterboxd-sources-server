@@ -13,8 +13,8 @@ data Transfer =
     { _tAvailability :: Maybe Integer
     , _tCreatedAt :: Maybe String
     , _tCurrentRatio :: Maybe Double
-    , _tDownloaded :: Maybe Integer
-    , _tUploaded :: Maybe Integer
+    , _tDownloaded :: Maybe Double
+    , _tUploaded :: Maybe Double
     , _tDownSpeed :: Maybe Integer
     , _tUpSpeed :: Maybe Integer
     , _tErrorMessage :: Maybe String

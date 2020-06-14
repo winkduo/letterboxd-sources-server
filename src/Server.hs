@@ -163,7 +163,7 @@ clearFileListCache :: ServerHandler ()
 clearFileListCache = do
   liftIO $ putStrLn "Clearing the cache..."
   cache <- asks _seFileListCache
-  liftIO $ putMVar cache Nothing
+  void $ liftIO $ swapMVar cache Nothing
 
 findMovie :: FindMovieReq -> ServerHandler [PutIO.TransferWithLink]
 findMovie (FindMovieReq name) = do
@@ -178,11 +178,14 @@ findMovie (FindMovieReq name) = do
       find_movie_transfers (PutIO._fId movie_download_folder)
     else do
       clearFileListCache
+      liftIO $ putStrLn "Finding movie from CI..."
       movies <- findMovieFromCI name
+      liftIO $ putStrLn "Movies from  CI:"
+      liftIO $ print movies
       traverse
         (attach_link <=<
          tryToAddTransfer (PutIO._fId movie_download_folder) . _mLink)
-        (take 10 movies)
+        (take 20 movies)
   where
     find_movie_transfers :: Integer -> ServerHandler [PutIO.TransferWithLink]
     find_movie_transfers movie_dir_id = do
@@ -312,7 +315,7 @@ runServer putIOAPIToken = do
     Right serverEnv ->
       liftIO $ do
         putStrLn "Server is ready to serve..."
-        Warp.run 8080 $ logStdoutDev $ app serverEnv
+        Warp.run 8081 $ logStdoutDev $ app serverEnv
 
 $(JSON.deriveJSON (aesonPrefix snakeCase) ''FindMovieReq)
 
