@@ -13,8 +13,8 @@ import           Data.Char                      ( isUpper )
 import qualified Data.Text                     as T
 import           GHC.Generics
 
-data Movie =
-  Movie
+data MovieChannel =
+  MovieChannel
     { _mId :: T.Text
     , _mLink :: T.Text
     , _mTitle :: T.Text
@@ -28,5 +28,5 @@ data Indexer =
     }
   deriving (Eq, Show, Generic)
 
-$(JSON.deriveJSON JSON.defaultOptions{JSON.fieldLabelModifier = uncapitalise . dropWhile (not . isUpper)} ''Movie)
+$(JSON.deriveJSON JSON.defaultOptions{JSON.fieldLabelModifier = uncapitalise . dropWhile (not . isUpper)} ''MovieChannel)
 $(JSON.deriveJSON JSON.defaultOptions{JSON.fieldLabelModifier = uncapitalise . dropWhile (not . isUpper)} ''Indexer)

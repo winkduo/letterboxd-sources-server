@@ -1,4 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -15,8 +17,11 @@ import Client.ChillInstitute.Types
 import qualified Client.PutIO.API as PutIO
 import Client.PutIO.Types as PutIO
 import Client.Util
+import Control.Arrow ((&&&))
+import Control.Concurrent.Async.Lifted
 import Control.Concurrent.MVar.Lifted
 import Control.Lens
+import Control.Monad.Base
 import Control.Monad.Except (liftEither)
 import Control.Monad.Except
 import Control.Monad.IO.Class (liftIO)
@@ -34,6 +39,7 @@ import qualified Data.ByteString.Lazy.Char8 as LBS8
 import Data.Char
 import Data.Foldable (find, traverse_)
 import Data.Functor (($>))
+import qualified Data.Map.Strict as M
 import Data.Monoid (First(..))
 import Data.Proxy (Proxy)
 import qualified Data.Text as T
@@ -59,30 +65,45 @@ import Servant.Server
 downloadDirName :: String
 downloadDirName = "Letterboxd Sources Download Dir"
 
+data MovieChannelState
+  = FoundMovieChannel MovieChannel
+  | RequestingDownload
+  | DownloadingMovie PutIO.TransferWithLink
+  | DownloadedMovie String PutIO.TransferWithLink
+
+data MovieStateSnapshot
+  = MSSFindingChannels
+  | MSSFoundChannels [MovieChannelState]
+
+data MovieState
+  = MSFindingChannels
+  | MSFoundChannels (M.Map T.Text (MVar MovieChannelState))
+
 data ServerEnv =
   ServerEnv
     { _sePutIODownloadDir :: PutIO.File
     , _sePutIOClientEnv :: ClientEnv
     , _seFileListCache :: MVar (Maybe [PutIO.File])
+    , _seMovieStates :: MVar (M.Map T.Text (MVar MovieState))
     }
 
-data FindMovieReq =
-  FindMovieReq
+data MovieStateReq =
+  MovieStateReq
     { _dmrName :: T.Text
     }
   deriving (Show, Eq, Generic)
 
 type API
-   = "find_movie" :> ReqBody '[ JSON] FindMovieReq :> Post '[ JSON] [PutIO.TransferWithLink]
+   = "movie_state" :> QueryParam' '[ Required] "name" T.Text :> Get '[ JSON] MovieStateSnapshot
 
 type ServerHandler = ReaderT ServerEnv Handler
 
-findMovieFromCI :: T.Text -> ServerHandler [Movie]
+findMovieFromCI :: T.Text -> ServerHandler [MovieChannel]
 findMovieFromCI movie_name = do
   clientEnv <- liftIO CIAPI.getClientEnv
   indexers <- callServantClient clientEnv CIAPI.getIndexers
   fmap mconcat $
-    for indexers $ \(Indexer iId _) -> do
+    for (take 5 indexers) $ \(Indexer iId _) -> do
       callServantClient clientEnv $ CIAPI.getMovies movie_name iId
 
 data PutIOErrorResponseExtra =
@@ -141,8 +162,6 @@ tryToAddTransfer parent_folder_id magnet_url = do
     Right (PutIO.TransferResponse transfer) -> do
       liftIO $ putStrLn $ "Added transfer with id: " <> PutIO._tName transfer
       pure transfer
-  where
-
 
 listFiles :: ServerHandler [PutIO.File]
 listFiles = do
@@ -165,8 +184,59 @@ clearFileListCache = do
   cache <- asks _seFileListCache
   void $ liftIO $ swapMVar cache Nothing
 
-findMovie :: FindMovieReq -> ServerHandler [PutIO.TransferWithLink]
-findMovie (FindMovieReq name) = do
+getMovieStateSnapshot :: MonadBase IO m => MovieState -> m MovieStateSnapshot
+getMovieStateSnapshot MSFindingChannels = pure MSSFindingChannels
+getMovieStateSnapshot (MSFoundChannels channels) =
+  MSSFoundChannels <$> traverse readMVar (M.elems channels)
+
+getMovieState :: T.Text -> ServerHandler MovieStateSnapshot
+getMovieState name
+  -- We don't directly "take" MVar to check existence of this entry, instead we first try to read it because that would cause every request to block on this single MVar, eventually causing overhead.
+ = do
+  movie_states_var <- asks _seMovieStates
+  (M.lookup name <$> readMVar movie_states_var) >>= \case
+    Just movie_state_var ->
+      liftIO . getMovieStateSnapshot =<< readMVar movie_state_var
+    Nothing -> do
+      movie_state_var <-
+        modifyMVar movie_states_var $ \movie_states ->
+          case M.lookup name movie_states of
+            Just movie_state_var -> do
+              pure (movie_states, movie_state_var)
+            Nothing -> do
+              let new_movie_state = MSFindingChannels
+              new_movie_state_var <- newMVar new_movie_state
+              let new_movie_states =
+                    M.insert name new_movie_state_var movie_states
+              pure (new_movie_states, new_movie_state_var)
+      (getMovieStateSnapshot =<< readMVar movie_state_var) <*
+        async (findMovieChannel name movie_state_var)
+
+findMovieChannel :: T.Text -> MVar MovieState -> ServerHandler ()
+findMovieChannel name movie_state_var
+   -- This is a very costly function, we return earlier if there are other threads that are modifying this movie's state.
+ = do
+  is_empty <- isEmptyMVar movie_state_var
+  if is_empty
+    then pure ()
+      -- Similarly, we need to start modifying early on so that other threads see the empty state var and return earlier.
+    else do
+      modifyMVar movie_state_var $ \case
+        MSFoundChannels channels -> do
+          pure (MSFoundChannels channels, ())
+        MSFindingChannels -> do
+          channels <- find_movie_channels
+          channel_vars <-
+            for channels $ \c -> (_mId c, ) <$> newMVar (FoundMovieChannel c)
+          pure (MSFoundChannels (M.fromList channel_vars), ())
+  where
+    find_movie_channels :: ServerHandler [MovieChannel]
+    find_movie_channels = do
+      liftIO $ putStrLn "Finding movie from CI..."
+      findMovieFromCI name
+
+downloadMovie :: T.Text -> ServerHandler [MovieChannelState]
+downloadMovie name = do
   download_dir <- asks _sePutIODownloadDir
   (exists, movie_download_folder) <-
     createOrFindFolder (PutIO._fId download_dir) name
@@ -175,27 +245,42 @@ findMovie (FindMovieReq name) = do
       liftIO $
         putStrLn
           "Download directory for this movie already exists, finding transfers associated with this directory."
-      find_movie_transfers (PutIO._fId movie_download_folder)
+      transfers <-
+        find_existing_movie_transfers (PutIO._fId movie_download_folder)
+      traverse transfer_to_movie_channel_state transfers
     else do
-      clearFileListCache
       liftIO $ putStrLn "Finding movie from CI..."
       movies <- findMovieFromCI name
       liftIO $ putStrLn "Movies from  CI:"
       liftIO $ print movies
-      traverse
-        (attach_link <=<
-         tryToAddTransfer (PutIO._fId movie_download_folder) . _mLink)
-        (take 20 movies)
+      transfers <-
+        traverse
+          (attach_link <=<
+           tryToAddTransfer (PutIO._fId movie_download_folder) . _mLink)
+          (take 20 movies)
+      traverse transfer_to_movie_channel_state transfers
   where
-    find_movie_transfers :: Integer -> ServerHandler [PutIO.TransferWithLink]
-    find_movie_transfers movie_dir_id = do
+    transfer_to_movie_channel_state ::
+         PutIO.TransferWithLink -> ServerHandler MovieChannelState
+    transfer_to_movie_channel_state twl@(PutIO.TransferWithLink _ (Just url)) =
+      pure $ DownloadedMovie url twl
+    transfer_to_movie_channel_state twl@(PutIO.TransferWithLink t@(PutIO.Transfer {_tPercentDone}) Nothing) =
+      case _tPercentDone of
+        Just 100 ->
+          find_download_link t >>= \case
+            Nothing -> pure $ DownloadingMovie twl
+            Just url -> pure $ DownloadedMovie url twl
+        _ -> pure $ DownloadingMovie twl
+    find_existing_movie_transfers ::
+         Integer -> ServerHandler [PutIO.TransferWithLink]
+    find_existing_movie_transfers movie_dir_id = do
       clientEnv <- asks _sePutIOClientEnv
       PutIO.TransfersResponse transfers <-
         callServantClient clientEnv PutIO.listTransfers
-      mapM attach_link $
+      traverse attach_link $
         filter ((== movie_dir_id) . PutIO._tSaveParentId) transfers
-    attach_link :: Transfer -> ServerHandler PutIO.TransferWithLink
-    attach_link t
+    find_download_link :: Transfer -> ServerHandler (Maybe String)
+    find_download_link t
       | Just file_id <- _tFileId t = do
         clientEnv <- asks _sePutIOClientEnv
         files <- listFiles
@@ -204,14 +289,16 @@ findMovie (FindMovieReq name) = do
             liftIO $
               putStrLn $
               "Couldn't find a mp4 file under the folder " <> show file_id
-            pure $ PutIO.TransferWithLink t Nothing
+            pure Nothing
           Just mp4_file -> do
             PutIO.FileDownloadUrlResponse url <-
               callServantClient
                 clientEnv
                 (PutIO.getFileDownloadUrl (PutIO._fId mp4_file))
-            pure $ PutIO.TransferWithLink t (Just url)
-      | otherwise = pure $ PutIO.TransferWithLink t Nothing
+            pure (Just url)
+      | otherwise = pure Nothing
+    attach_link :: Transfer -> ServerHandler PutIO.TransferWithLink
+    attach_link t = PutIO.TransferWithLink t <$> find_download_link t
     find_mp4_file_of_file_or_folder ::
          [PutIO.File] -> Integer -> ServerHandler (First PutIO.File)
     find_mp4_file_of_file_or_folder all_files file_id =
@@ -252,7 +339,7 @@ createOrFindFolder parent_folder_id name = do
     Just f -> pure (True, f)
 
 server :: ServerT API ServerHandler
-server = findMovie
+server = getMovieState
 
 callServantClient :: ClientEnv -> ClientM a -> ServerHandler a
 callServantClient clientEnv clientM = do
@@ -270,6 +357,7 @@ mkServerEnv api_token = do
   _sePutIOClientEnv <- liftIO $ PutIO.getClientEnv api_token
   _sePutIODownloadDir <- find_download_dir _sePutIOClientEnv
   _seFileListCache <- newMVar Nothing
+  _seMovieStates <- newMVar M.empty
   pure ServerEnv {..}
   where
     is_download_dir :: PutIO.File -> Bool
@@ -317,8 +405,12 @@ runServer putIOAPIToken = do
         putStrLn "Server is ready to serve..."
         Warp.run 8081 $ logStdoutDev $ app serverEnv
 
-$(JSON.deriveJSON (aesonPrefix snakeCase) ''FindMovieReq)
+$(JSON.deriveJSON (aesonPrefix snakeCase) ''MovieStateReq)
 
 $(JSON.deriveJSON (aesonPrefix snakeCase) ''PutIOErrorResponse)
 
 $(JSON.deriveJSON (aesonPrefix snakeCase) ''PutIOErrorResponseExtra)
+
+$(JSON.deriveJSON (aesonPrefix snakeCase) ''MovieStateSnapshot)
+
+$(JSON.deriveJSON (aesonPrefix snakeCase) ''MovieChannelState)

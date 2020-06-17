@@ -51,3 +51,6 @@ executables:
     - http-types
     - lens
     - lifted-base
+    - containers
+    - lifted-async
+    - transformers-base

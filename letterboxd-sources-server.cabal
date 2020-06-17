@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: e9401de9c1f60e6cfcd418efdaa4ff18bad34dce2e796b8684155e2c99c4d448
+-- hash: cecb2525ec5aeb21eb6cf3f829895f78377ad2f9d0e9bc13c307c3ef10059a77
 
 name:           letterboxd-sources-server
 version:        0.1.0.0
@@ -44,11 +44,13 @@ executable letterboxd-sources-server-exe
     , aeson-casing
     , base >=4.7 && <5
     , bytestring
+    , containers
     , http-api-data
     , http-client
     , http-client-tls
     , http-types
     , lens
+    , lifted-async
     , lifted-base
     , monad-logger
     , mtl
@@ -57,6 +59,7 @@ executable letterboxd-sources-server-exe
     , servant-client-core
     , servant-server
     , text
+    , transformers-base
     , wai
     , wai-cors
     , wai-extra

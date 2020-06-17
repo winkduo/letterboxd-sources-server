@@ -21,12 +21,12 @@ import Servant
 import Servant.Client
 
 type ChillInstituteAPI
-   = "search" :> QueryParam' '[ Required] "keyword" T.Text :> QueryParam' '[ Required] "indexer" T.Text :> Get '[ JSON] [Movie] :<|> "indexers" :> Get '[ JSON] [Indexer]
+   = "search" :> QueryParam' '[ Required] "keyword" T.Text :> QueryParam' '[ Required] "indexer" T.Text :> Get '[ JSON] [MovieChannel] :<|> "indexers" :> Get '[ JSON] [Indexer]
 
 api :: Proxy ChillInstituteAPI
 api = Proxy
 
-getMovies :: T.Text -> T.Text -> ClientM [Movie]
+getMovies :: T.Text -> T.Text -> ClientM [MovieChannel]
 getIndexers :: ClientM [Indexer]
 getMovies :<|> getIndexers = client api
 
