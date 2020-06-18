@@ -72,11 +72,13 @@ data MovieChannelState
   | DownloadedMovie String PutIO.TransferWithLink
 
 data MovieStateSnapshot
-  = MSSFindingChannels
+  = MSSNoChannelsYet
+  | MSSUpdatingMovieChannels
   | MSSFoundChannels [MovieChannelState]
 
 data MovieState
-  = MSFindingChannels
+  = MSNoChannelsYet
+  | MSUpdatingMovieChannels
   | MSFoundChannels (M.Map T.Text (MVar MovieChannelState))
 
 data ServerEnv =
@@ -185,7 +187,8 @@ clearFileListCache = do
   void $ liftIO $ swapMVar cache Nothing
 
 getMovieStateSnapshot :: MonadBase IO m => MovieState -> m MovieStateSnapshot
-getMovieStateSnapshot MSFindingChannels = pure MSSFindingChannels
+getMovieStateSnapshot MSNoChannelsYet = pure MSSNoChannelsYet
+getMovieStateSnapshot MSUpdatingMovieChannels = pure MSSUpdatingMovieChannels
 getMovieStateSnapshot (MSFoundChannels channels) =
   MSSFoundChannels <$> traverse readMVar (M.elems channels)
 
@@ -196,7 +199,9 @@ getMovieState name
   movie_states_var <- asks _seMovieStates
   (M.lookup name <$> readMVar movie_states_var) >>= \case
     Just movie_state_var ->
-      liftIO . getMovieStateSnapshot =<< readMVar movie_state_var
+      tryReadMVar movie_state_var >>= \case
+        Just movie_state -> liftIO $ getMovieStateSnapshot movie_state
+        Nothing -> pure MSSUpdatingMovieChannels
     Nothing -> do
       movie_state_var <-
         modifyMVar movie_states_var $ \movie_states ->
@@ -204,7 +209,7 @@ getMovieState name
             Just movie_state_var -> do
               pure (movie_states, movie_state_var)
             Nothing -> do
-              let new_movie_state = MSFindingChannels
+              let new_movie_state = MSNoChannelsYet
               new_movie_state_var <- newMVar new_movie_state
               let new_movie_states =
                     M.insert name new_movie_state_var movie_states
@@ -224,7 +229,7 @@ findMovieChannel name movie_state_var
       modifyMVar movie_state_var $ \case
         MSFoundChannels channels -> do
           pure (MSFoundChannels channels, ())
-        MSFindingChannels -> do
+        MSNoChannelsYet -> do
           channels <- find_movie_channels
           channel_vars <-
             for channels $ \c -> (_mId c, ) <$> newMVar (FoundMovieChannel c)
