@@ -20,6 +20,7 @@ import Client.Util
 import Control.Arrow ((&&&))
 import Control.Concurrent.Async.Lifted
 import Control.Concurrent.MVar.Lifted
+import Control.Concurrent.Timeout
 import Control.Lens
 import Control.Monad.Base
 import Control.Monad.Except (liftEither)
@@ -68,8 +69,11 @@ downloadDirName = "Letterboxd Sources Download Dir"
 data MovieChannelState
   = FoundMovieChannel MovieChannel
   | RequestingDownload
-  | DownloadingMovie PutIO.TransferWithLink
-  | DownloadedMovie String PutIO.TransferWithLink
+  | WatchingDownloadProgress
+  | DownloadingMovie Transfer
+  | FindingDownloadLink Transfer
+  | DownloadedMovie String Transfer
+  | CannotDownloadMovie FindDownloadLinkError
 
 data MovieStateSnapshot
   = MSSNoChannelsYet
@@ -96,7 +100,7 @@ data MovieStateReq =
   deriving (Show, Eq, Generic)
 
 type API
-   = "movie_state" :> QueryParam' '[ Required] "name" T.Text :> Get '[ JSON] MovieStateSnapshot
+   = "movie_state" :> QueryParam' '[ Required] "name" T.Text :> Get '[ JSON] MovieStateSnapshot :<|> "download_movie" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "channel_id" T.Text :> Post '[ JSON] ()
 
 type ServerHandler = ReaderT ServerEnv Handler
 
@@ -240,70 +244,83 @@ findMovieChannel name movie_state_var
       liftIO $ putStrLn "Finding movie from CI..."
       findMovieFromCI name
 
-downloadMovie :: T.Text -> ServerHandler [MovieChannelState]
-downloadMovie name = do
+data FindDownloadLinkError
+  = NoMp4FileUnderFolder Integer
+  | NoFileIdInTheTransfer
+  deriving (Eq)
+
+instance Show FindDownloadLinkError where
+  show (NoMp4FileUnderFolder folder_id) =
+    "Couldn't find a mp4 file under the folder " <> show folder_id <> "."
+  show NoFileIdInTheTransfer = "No file_id could be found for the transfer."
+
+instance JSON.ToJSON FindDownloadLinkError where
+  toJSON = JSON.String . T.pack . show
+
+downloadMovieFromChannel ::
+     T.Text -> MovieChannel -> MVar MovieChannelState -> ServerHandler ()
+downloadMovieFromChannel movie_name channel channel_state_var = do
   download_dir <- asks _sePutIODownloadDir
   (exists, movie_download_folder) <-
-    createOrFindFolder (PutIO._fId download_dir) name
-  if exists
-    then do
-      liftIO $
-        putStrLn
-          "Download directory for this movie already exists, finding transfers associated with this directory."
-      transfers <-
-        find_existing_movie_transfers (PutIO._fId movie_download_folder)
-      traverse transfer_to_movie_channel_state transfers
-    else do
-      liftIO $ putStrLn "Finding movie from CI..."
-      movies <- findMovieFromCI name
-      liftIO $ putStrLn "Movies from  CI:"
-      liftIO $ print movies
-      transfers <-
-        traverse
-          (attach_link <=<
-           tryToAddTransfer (PutIO._fId movie_download_folder) . _mLink)
-          (take 20 movies)
-      traverse transfer_to_movie_channel_state transfers
+    createOrFindFolder (PutIO._fId download_dir) movie_name
+  void $
+    async $ do
+      transfer <-
+        tryToAddTransfer (PutIO._fId movie_download_folder) (_mLink channel)
+      modifyMVar channel_state_var $ \case
+        RequestingDownload -> do
+          void $ async $ do update_movie_download_progress channel_state_var
+          pure (DownloadingMovie transfer, ())
+        other -> pure (other, ())
   where
-    transfer_to_movie_channel_state ::
-         PutIO.TransferWithLink -> ServerHandler MovieChannelState
-    transfer_to_movie_channel_state twl@(PutIO.TransferWithLink _ (Just url)) =
-      pure $ DownloadedMovie url twl
-    transfer_to_movie_channel_state twl@(PutIO.TransferWithLink t@(PutIO.Transfer {_tPercentDone}) Nothing) =
-      case _tPercentDone of
-        Just 100 ->
+    update_movie_download_progress :: MVar MovieChannelState -> ServerHandler ()
+    update_movie_download_progress channel_state_var
+      -- | Invariant: This is the only thread that uses channel_state_var. This is guaranteed by guarding state on 'RequestingDownload' above.
+      --
+      -- This invariant allows us to only modify the state when we are finished processing the costly operations (ie. find_download_link), thereby allowing variable to be read by other threads frequently, without long blocked times. Being able to read channel_state_var frequently is important because taking snapshot of the whole state needs also channel_state_vars to be read.
+     = do
+      channel_state <- takeMVar channel_state_var
+      case channel_state of
+        (DownloadedMovie url _) -> do
+          pure ()
+        (DownloadingMovie t@(PutIO.Transfer {_tPercentDone = Just 100})) -> do
+          putMVar channel_state_var (FindingDownloadLink t)
+          -- Temporarily releasing the variable so that readers can get a snapshot of the state.
           find_download_link t >>= \case
-            Nothing -> pure $ DownloadingMovie twl
-            Just url -> pure $ DownloadedMovie url twl
-        _ -> pure $ DownloadingMovie twl
-    find_existing_movie_transfers ::
-         Integer -> ServerHandler [PutIO.TransferWithLink]
-    find_existing_movie_transfers movie_dir_id = do
-      clientEnv <- asks _sePutIOClientEnv
-      PutIO.TransfersResponse transfers <-
-        callServantClient clientEnv PutIO.listTransfers
-      traverse attach_link $
-        filter ((== movie_dir_id) . PutIO._tSaveParentId) transfers
-    find_download_link :: Transfer -> ServerHandler (Maybe String)
+            Right url ->
+              modifyMVar channel_state_var $
+              pure . const ((DownloadedMovie url t), ())
+            Left err -> do
+              modifyMVar channel_state_var $
+                pure . const ((CannotDownloadMovie err), ())
+        (DownloadingMovie t) -> do
+          putMVar channel_state_var channel_state
+          clientEnv <- asks _sePutIOClientEnv
+          PutIO.TransferResponse transfer <-
+            callServantClient clientEnv (PutIO.getTransfer (_tId t))
+          threadDelay (5 :: Seconds)
+          modifyMVar channel_state_var $
+            pure . const ((DownloadingMovie transfer), ())
+          update_movie_download_progress channel_state_var
+        FindingDownloadLink _ ->
+          error
+            "Invariant violated: there shouldn't be any other modifiers to channel_state_var MVar and this is an interim state in a single thread."
+    find_download_link ::
+         Transfer -> ServerHandler (Either FindDownloadLinkError String)
     find_download_link t
       | Just file_id <- _tFileId t = do
         clientEnv <- asks _sePutIOClientEnv
         files <- listFiles
         getFirst <$> find_mp4_file_of_file_or_folder files file_id >>= \case
           Nothing -> do
-            liftIO $
-              putStrLn $
-              "Couldn't find a mp4 file under the folder " <> show file_id
-            pure Nothing
+            pure $ Left $ NoMp4FileUnderFolder file_id
           Just mp4_file -> do
             PutIO.FileDownloadUrlResponse url <-
               callServantClient
                 clientEnv
                 (PutIO.getFileDownloadUrl (PutIO._fId mp4_file))
-            pure (Just url)
-      | otherwise = pure Nothing
-    attach_link :: Transfer -> ServerHandler PutIO.TransferWithLink
-    attach_link t = PutIO.TransferWithLink t <$> find_download_link t
+            pure (Right url)
+      | otherwise = pure $ Left NoFileIdInTheTransfer
     find_mp4_file_of_file_or_folder ::
          [PutIO.File] -> Integer -> ServerHandler (First PutIO.File)
     find_mp4_file_of_file_or_folder all_files file_id =
@@ -325,6 +342,58 @@ downloadMovie name = do
               liftIO $ putStrLn $ "Unknown file type: " <> _fFileType
               pure $ First Nothing
 
+downloadMovieReq :: T.Text -> T.Text -> ServerHandler ()
+downloadMovieReq movie_name channel_id = do
+  movie_states <- asks _seMovieStates >>= readMVar
+  case M.lookup movie_name movie_states of
+    Nothing ->
+      throw400 $
+      "Movie " <> T.unpack movie_name <> " couldn't find in the list of movies."
+    Just movie_state_var ->
+      readMVar movie_state_var >>= \case
+        MSNoChannelsYet ->
+          throw400 $
+          "Movie " <>
+          T.unpack movie_name <>
+          " has no channels yet (and not looking for channels at the moment)."
+        MSUpdatingMovieChannels ->
+          throw400 $
+          "Movie " <>
+          T.unpack movie_name <>
+          " has no channels yet (and looking for channels at the moment)."
+        MSFoundChannels channels -> download_from_channel channels
+  where
+    download_from_channel ::
+         M.Map T.Text (MVar MovieChannelState) -> ReaderT ServerEnv Handler ()
+    download_from_channel channels =
+      case M.lookup channel_id channels of
+        Nothing ->
+          throw400 $
+          "Movie " <>
+          T.unpack movie_name <>
+          " doesn't have a channel with id " <> T.unpack channel_id
+        Just channel_state_var ->
+          modifyMVar channel_state_var $ \channel_state ->
+            case channel_state of
+              FoundMovieChannel channel
+                -- TODO: Async download movie & switch state to RequestingDownload.
+               -> do
+                async $
+                  downloadMovieFromChannel movie_name channel channel_state_var
+                pure (RequestingDownload, ())
+              RequestingDownload
+                -- This channel is already requesting a download so we don't do anything.
+               -> pure (channel_state, ())
+              DownloadingMovie _
+                -- This channel is already downloading the movie so we don't do anything.
+               -> pure (channel_state, ())
+              DownloadedMovie _ _
+                -- This channel has already downloaded the movie so we don't do anything.
+               -> pure (channel_state, ())
+
+throw400 :: String -> ServerHandler a
+throw400 message = throwError (err400 {errBody = LBS8.pack message})
+
 throw500 :: String -> ServerHandler a
 throw500 message = throwError (err500 {errBody = LBS8.pack message})
 
@@ -344,7 +413,7 @@ createOrFindFolder parent_folder_id name = do
     Just f -> pure (True, f)
 
 server :: ServerT API ServerHandler
-server = getMovieState
+server = getMovieState :<|> downloadMovieReq
 
 callServantClient :: ClientEnv -> ClientM a -> ServerHandler a
 callServantClient clientEnv clientM = do
@@ -416,6 +485,6 @@ $(JSON.deriveJSON (aesonPrefix snakeCase) ''PutIOErrorResponse)
 
 $(JSON.deriveJSON (aesonPrefix snakeCase) ''PutIOErrorResponseExtra)
 
-$(JSON.deriveJSON (aesonPrefix snakeCase) ''MovieStateSnapshot)
+$(JSON.deriveToJSON (aesonPrefix snakeCase) ''MovieStateSnapshot)
 
-$(JSON.deriveJSON (aesonPrefix snakeCase) ''MovieChannelState)
+$(JSON.deriveToJSON (aesonPrefix snakeCase) ''MovieChannelState)

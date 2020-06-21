@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: cecb2525ec5aeb21eb6cf3f829895f78377ad2f9d0e9bc13c307c3ef10059a77
+-- hash: 3103ea11211bcb35095ef56e714b2f102249bbbc44d380bad7d598fbfad5615e
 
 name:           letterboxd-sources-server
 version:        0.1.0.0
@@ -60,6 +60,7 @@ executable letterboxd-sources-server-exe
     , servant-server
     , text
     , transformers-base
+    , typed-duration
     , wai
     , wai-cors
     , wai-extra
