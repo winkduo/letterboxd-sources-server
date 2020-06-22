@@ -18,9 +18,9 @@ import qualified Client.PutIO.API as PutIO
 import Client.PutIO.Types as PutIO
 import Client.Util
 import Control.Arrow ((&&&))
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async.Lifted
 import Control.Concurrent.MVar.Lifted
-import Control.Concurrent.Timeout
 import Control.Lens
 import Control.Monad.Base
 import Control.Monad.Except (liftEither)
@@ -90,7 +90,7 @@ data ServerEnv =
     { _sePutIODownloadDir :: PutIO.File
     , _sePutIOClientEnv :: ClientEnv
     , _seFileListCache :: MVar (Maybe [PutIO.File])
-    , _seMovieStates :: MVar (M.Map T.Text (MVar MovieState))
+    , _seMovieStates :: MVar (M.Map MovieQualifier (MVar MovieState))
     }
 
 data MovieStateReq =
@@ -100,7 +100,7 @@ data MovieStateReq =
   deriving (Show, Eq, Generic)
 
 type API
-   = "movie_state" :> QueryParam' '[ Required] "name" T.Text :> Get '[ JSON] MovieStateSnapshot :<|> "download_movie" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "channel_id" T.Text :> Post '[ JSON] ()
+   = "movie_state" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "year" Integer :> Get '[ JSON] MovieStateSnapshot :<|> "download_movie" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "year" Integer :> QueryParam' '[ Required] "channel_id" T.Text :> Post '[ JSON] ()
 
 type ServerHandler = ReaderT ServerEnv Handler
 
@@ -196,12 +196,20 @@ getMovieStateSnapshot MSUpdatingMovieChannels = pure MSSUpdatingMovieChannels
 getMovieStateSnapshot (MSFoundChannels channels) =
   MSSFoundChannels <$> traverse readMVar (M.elems channels)
 
-getMovieState :: T.Text -> ServerHandler MovieStateSnapshot
-getMovieState name
+data MovieQualifier =
+  MovieQualifier
+    { _mqName :: T.Text
+    , _mqYear :: Integer
+    }
+  deriving (Eq, Ord, Show)
+
+getMovieState :: T.Text -> Integer -> ServerHandler MovieStateSnapshot
+getMovieState name year
   -- We don't directly "take" MVar to check existence of this entry, instead we first try to read it because that would cause every request to block on this single MVar, eventually causing overhead.
  = do
+  let movie_qualifier = MovieQualifier name year
   movie_states_var <- asks _seMovieStates
-  (M.lookup name <$> readMVar movie_states_var) >>= \case
+  (M.lookup movie_qualifier <$> readMVar movie_states_var) >>= \case
     Just movie_state_var ->
       tryReadMVar movie_state_var >>= \case
         Just movie_state -> liftIO $ getMovieStateSnapshot movie_state
@@ -209,36 +217,37 @@ getMovieState name
     Nothing -> do
       movie_state_var <-
         modifyMVar movie_states_var $ \movie_states ->
-          case M.lookup name movie_states of
+          case M.lookup movie_qualifier movie_states of
             Just movie_state_var -> do
               pure (movie_states, movie_state_var)
             Nothing -> do
               let new_movie_state = MSNoChannelsYet
               new_movie_state_var <- newMVar new_movie_state
               let new_movie_states =
-                    M.insert name new_movie_state_var movie_states
+                    M.insert movie_qualifier new_movie_state_var movie_states
               pure (new_movie_states, new_movie_state_var)
       (getMovieStateSnapshot =<< readMVar movie_state_var) <*
-        async (findMovieChannel name movie_state_var)
-
-findMovieChannel :: T.Text -> MVar MovieState -> ServerHandler ()
-findMovieChannel name movie_state_var
-   -- This is a very costly function, we return earlier if there are other threads that are modifying this movie's state.
- = do
-  is_empty <- isEmptyMVar movie_state_var
-  if is_empty
-    then pure ()
-      -- Similarly, we need to start modifying early on so that other threads see the empty state var and return earlier.
-    else do
-      modifyMVar movie_state_var $ \case
-        MSFoundChannels channels -> do
-          pure (MSFoundChannels channels, ())
-        MSNoChannelsYet -> do
-          channels <- find_movie_channels
-          channel_vars <-
-            for channels $ \c -> (_mId c, ) <$> newMVar (FoundMovieChannel c)
-          pure (MSFoundChannels (M.fromList channel_vars), ())
+        async (start_searching_for_channels name movie_state_var)
   where
+    start_searching_for_channels ::
+         T.Text -> MVar MovieState -> ServerHandler ()
+    start_searching_for_channels name movie_state_var
+       -- This is a very costly function, we return earlier if there are other threads that are modifying this movie's state.
+     = do
+      is_empty <- isEmptyMVar movie_state_var
+      if is_empty
+        then pure ()
+          -- Similarly, we need to start modifying early on so that other threads see the empty state var and return earlier.
+        else do
+          modifyMVar movie_state_var $ \case
+            MSFoundChannels channels -> do
+              pure (MSFoundChannels channels, ())
+            MSNoChannelsYet -> do
+              channels <- find_movie_channels
+              channel_vars <-
+                for channels $ \c ->
+                  (_mId c, ) <$> newMVar (FoundMovieChannel c)
+              pure (MSFoundChannels (M.fromList channel_vars), ())
     find_movie_channels :: ServerHandler [MovieChannel]
     find_movie_channels = do
       liftIO $ putStrLn "Finding movie from CI..."
@@ -298,7 +307,7 @@ downloadMovieFromChannel movie_name channel channel_state_var = do
           clientEnv <- asks _sePutIOClientEnv
           PutIO.TransferResponse transfer <-
             callServantClient clientEnv (PutIO.getTransfer (_tId t))
-          threadDelay (5 :: Seconds)
+          liftIO $ threadDelay (3 * (10 ^ 6))
           modifyMVar channel_state_var $
             pure . const ((DownloadingMovie transfer), ())
           update_movie_download_progress channel_state_var
@@ -342,54 +351,68 @@ downloadMovieFromChannel movie_name channel channel_state_var = do
               liftIO $ putStrLn $ "Unknown file type: " <> _fFileType
               pure $ First Nothing
 
-downloadMovieReq :: T.Text -> T.Text -> ServerHandler ()
-downloadMovieReq movie_name channel_id = do
+findMovieStateVar :: MovieQualifier -> ServerHandler (MVar MovieState)
+findMovieStateVar movie_qualifier@(MovieQualifier {_mqName}) = do
   movie_states <- asks _seMovieStates >>= readMVar
-  case M.lookup movie_name movie_states of
+  case M.lookup movie_qualifier movie_states of
     Nothing ->
       throw400 $
-      "Movie " <> T.unpack movie_name <> " couldn't find in the list of movies."
-    Just movie_state_var ->
-      readMVar movie_state_var >>= \case
-        MSNoChannelsYet ->
-          throw400 $
-          "Movie " <>
-          T.unpack movie_name <>
-          " has no channels yet (and not looking for channels at the moment)."
-        MSUpdatingMovieChannels ->
-          throw400 $
-          "Movie " <>
-          T.unpack movie_name <>
-          " has no channels yet (and looking for channels at the moment)."
-        MSFoundChannels channels -> download_from_channel channels
-  where
-    download_from_channel ::
-         M.Map T.Text (MVar MovieChannelState) -> ReaderT ServerEnv Handler ()
-    download_from_channel channels =
+      "Movie " <>
+      T.unpack _mqName <> " couldn't be found in the list of movies."
+    Just movie_state_var -> pure movie_state_var
+
+findMovieChannel ::
+     T.Text
+  -> T.Text
+  -> MVar MovieState
+  -> ServerHandler (MVar MovieChannelState)
+findMovieChannel name channel_id movie_state_var =
+  readMVar movie_state_var >>= \case
+    MSNoChannelsYet ->
+      throw400 $
+      "Movie " <>
+      T.unpack name <>
+      " has no channels yet (and not looking for channels at the moment)."
+    MSUpdatingMovieChannels ->
+      throw400 $
+      "Movie " <>
+      T.unpack name <>
+      " has no channels yet (and looking for channels at the moment)."
+    MSFoundChannels channels ->
       case M.lookup channel_id channels of
         Nothing ->
           throw400 $
           "Movie " <>
-          T.unpack movie_name <>
+          T.unpack name <>
           " doesn't have a channel with id " <> T.unpack channel_id
-        Just channel_state_var ->
-          modifyMVar channel_state_var $ \channel_state ->
-            case channel_state of
-              FoundMovieChannel channel
-                -- TODO: Async download movie & switch state to RequestingDownload.
-               -> do
-                async $
-                  downloadMovieFromChannel movie_name channel channel_state_var
-                pure (RequestingDownload, ())
-              RequestingDownload
-                -- This channel is already requesting a download so we don't do anything.
-               -> pure (channel_state, ())
-              DownloadingMovie _
-                -- This channel is already downloading the movie so we don't do anything.
-               -> pure (channel_state, ())
-              DownloadedMovie _ _
-                -- This channel has already downloaded the movie so we don't do anything.
-               -> pure (channel_state, ())
+        Just channel_state_var -> pure channel_state_var
+
+downloadMovieReq :: T.Text -> Integer -> T.Text -> ServerHandler ()
+downloadMovieReq name year channel_id = do
+  let movie_qualifier = MovieQualifier name year
+  movie_state_var <- findMovieStateVar movie_qualifier
+  channel_state_var <- findMovieChannel name channel_id movie_state_var
+  download_from_channel channel_state_var
+  where
+    download_from_channel ::
+         MVar MovieChannelState -> ReaderT ServerEnv Handler ()
+    download_from_channel channel_state_var =
+      modifyMVar channel_state_var $ \channel_state ->
+        case channel_state of
+          FoundMovieChannel channel
+            -- TODO: Async download movie & switch state to RequestingDownload.
+           -> do
+            async $ downloadMovieFromChannel name channel channel_state_var
+            pure (RequestingDownload, ())
+          RequestingDownload
+            -- This channel is already requesting a download so we don't do anything.
+           -> pure (channel_state, ())
+          DownloadingMovie _
+            -- This channel is already downloading the movie so we don't do anything.
+           -> pure (channel_state, ())
+          DownloadedMovie _ _
+            -- This channel has already downloaded the movie so we don't do anything.
+           -> pure (channel_state, ())
 
 throw400 :: String -> ServerHandler a
 throw400 message = throwError (err400 {errBody = LBS8.pack message})

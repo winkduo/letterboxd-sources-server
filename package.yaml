@@ -54,4 +54,3 @@ executables:
     - containers
     - lifted-async
     - transformers-base
-    - typed-duration

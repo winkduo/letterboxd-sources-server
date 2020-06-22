@@ -1,8 +1,8 @@
-{ mkDerivation, aeson, aeson-casing, base, bytestring, hpack
-, http-api-data, http-client, http-client-tls, http-types, lens
-, lifted-base, monad-logger, mtl, servant, servant-client
-, servant-client-core, servant-server, stdenv, text, wai, wai-cors
-, wai-extra, warp
+{ mkDerivation, aeson, aeson-casing, base, bytestring, containers
+, hpack, http-api-data, http-client, http-client-tls, http-types
+, lens, lifted-async, lifted-base, monad-logger, mtl, servant
+, servant-client, servant-client-core, servant-server, stdenv, text
+, transformers-base, wai, wai-cors, wai-extra, warp
 }:
 mkDerivation {
   pname = "letterboxd-sources-server";
@@ -12,9 +12,10 @@ mkDerivation {
   isExecutable = true;
   libraryToolDepends = [ hpack ];
   executableHaskellDepends = [
-    aeson aeson-casing base bytestring http-api-data http-client
-    http-client-tls http-types lens lifted-base monad-logger mtl
-    servant servant-client servant-client-core servant-server text wai
+    aeson aeson-casing base bytestring containers http-api-data
+    http-client http-client-tls http-types lens lifted-async
+    lifted-base monad-logger mtl servant servant-client
+    servant-client-core servant-server text transformers-base wai
     wai-cors wai-extra warp
   ];
   prePatch = "hpack";
