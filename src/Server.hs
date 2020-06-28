@@ -21,6 +21,7 @@ import Control.Arrow ((&&&))
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async.Lifted
 import Control.Concurrent.MVar.Lifted
+import Control.Concurrent.SWS
 import Control.Lens
 import Control.Monad.Base
 import Control.Monad.Except (liftEither)
@@ -29,6 +30,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Logger.CallStack
 import Control.Monad.Reader
 import Control.Monad.State
+import Control.Monad.Trans.Control (MonadBaseControl)
 import qualified Data.Aeson as JSON
 import Data.Aeson.Casing
 import qualified Data.Aeson.TH as JSON
@@ -60,7 +62,6 @@ import Servant.Client
   , runClientM
   )
 
--- import Servant.Client.Core (FailureResponse(..))
 import Servant.Server
 
 downloadDirName :: String
@@ -71,7 +72,6 @@ data MovieChannelState
   | RequestingDownload
   | WatchingDownloadProgress
   | DownloadingMovie Transfer
-  | FindingDownloadLink Transfer
   | DownloadedMovie String Transfer
   | CannotDownloadMovie FindDownloadLinkError
 
@@ -83,14 +83,14 @@ data MovieStateSnapshot
 data MovieState
   = MSNoChannelsYet
   | MSUpdatingMovieChannels
-  | MSFoundChannels (M.Map T.Text (MVar MovieChannelState))
+  | MSFoundChannels (M.Map T.Text (SWS MovieChannelState))
 
 data ServerEnv =
   ServerEnv
     { _sePutIODownloadDir :: PutIO.File
     , _sePutIOClientEnv :: ClientEnv
     , _seFileListCache :: MVar (Maybe [PutIO.File])
-    , _seMovieStates :: MVar (M.Map MovieQualifier (MVar MovieState))
+    , _seMovieStates :: SWS (M.Map MovieQualifier (SWS MovieState))
     }
 
 data MovieStateReq =
@@ -190,11 +190,12 @@ clearFileListCache = do
   cache <- asks _seFileListCache
   void $ liftIO $ swapMVar cache Nothing
 
-getMovieStateSnapshot :: MonadBase IO m => MovieState -> m MovieStateSnapshot
+getMovieStateSnapshot ::
+     (MonadIO m, MonadBaseControl IO m) => MovieState -> m MovieStateSnapshot
 getMovieStateSnapshot MSNoChannelsYet = pure MSSNoChannelsYet
 getMovieStateSnapshot MSUpdatingMovieChannels = pure MSSUpdatingMovieChannels
 getMovieStateSnapshot (MSFoundChannels channels) =
-  MSSFoundChannels <$> traverse readMVar (M.elems channels)
+  MSSFoundChannels <$> traverse readSWS (M.elems channels)
 
 data MovieQualifier =
   MovieQualifier
@@ -209,45 +210,39 @@ getMovieState name year
  = do
   let movie_qualifier = MovieQualifier name year
   movie_states_var <- asks _seMovieStates
-  (M.lookup movie_qualifier <$> readMVar movie_states_var) >>= \case
+  (M.lookup movie_qualifier <$> readSWS movie_states_var) >>= \case
     Just movie_state_var ->
-      tryReadMVar movie_state_var >>= \case
-        Just movie_state -> liftIO $ getMovieStateSnapshot movie_state
-        Nothing -> pure MSSUpdatingMovieChannels
+      readSWS movie_state_var >>= liftIO . getMovieStateSnapshot
     Nothing -> do
       movie_state_var <-
-        modifyMVar movie_states_var $ \movie_states ->
+        modifySWS movie_states_var $ \movie_states ->
           case M.lookup movie_qualifier movie_states of
             Just movie_state_var -> do
               pure (movie_states, movie_state_var)
             Nothing -> do
               let new_movie_state = MSNoChannelsYet
-              new_movie_state_var <- newMVar new_movie_state
+              new_movie_state_var <- newSWS new_movie_state
               let new_movie_states =
                     M.insert movie_qualifier new_movie_state_var movie_states
               pure (new_movie_states, new_movie_state_var)
-      (getMovieStateSnapshot =<< readMVar movie_state_var) <*
+      (getMovieStateSnapshot =<< readSWS movie_state_var) <*
         async (start_searching_for_channels name movie_state_var)
   where
-    start_searching_for_channels ::
-         T.Text -> MVar MovieState -> ServerHandler ()
+    start_searching_for_channels :: T.Text -> SWS MovieState -> ServerHandler ()
     start_searching_for_channels name movie_state_var
        -- This is a very costly function, we return earlier if there are other threads that are modifying this movie's state.
      = do
-      is_empty <- isEmptyMVar movie_state_var
-      if is_empty
-        then pure ()
-          -- Similarly, we need to start modifying early on so that other threads see the empty state var and return earlier.
-        else do
-          modifyMVar movie_state_var $ \case
-            MSFoundChannels channels -> do
-              pure (MSFoundChannels channels, ())
+      readSWS movie_state_var >>= \case
+        MSNoChannelsYet -> do
+          modifySWS movie_state_var $ \case
             MSNoChannelsYet -> do
               channels <- find_movie_channels
               channel_vars <-
-                for channels $ \c ->
-                  (_mId c, ) <$> newMVar (FoundMovieChannel c)
+                for channels $ \c -> (_mId c, ) <$> newSWS (FoundMovieChannel c)
               pure (MSFoundChannels (M.fromList channel_vars), ())
+            other -> pure (other, ())
+        _ -> do
+          pure ()
     find_movie_channels :: ServerHandler [MovieChannel]
     find_movie_channels = do
       liftIO $ putStrLn "Finding movie from CI..."
@@ -267,7 +262,7 @@ instance JSON.ToJSON FindDownloadLinkError where
   toJSON = JSON.String . T.pack . show
 
 downloadMovieFromChannel ::
-     T.Text -> MovieChannel -> MVar MovieChannelState -> ServerHandler ()
+     T.Text -> MovieChannel -> SWS MovieChannelState -> ServerHandler ()
 downloadMovieFromChannel movie_name channel channel_state_var = do
   download_dir <- asks _sePutIODownloadDir
   (exists, movie_download_folder) <-
@@ -276,44 +271,36 @@ downloadMovieFromChannel movie_name channel channel_state_var = do
     async $ do
       transfer <-
         tryToAddTransfer (PutIO._fId movie_download_folder) (_mLink channel)
-      modifyMVar channel_state_var $ \case
+      modifySWS channel_state_var $ \case
         RequestingDownload -> do
           void $ async $ do update_movie_download_progress channel_state_var
           pure (DownloadingMovie transfer, ())
         other -> pure (other, ())
   where
-    update_movie_download_progress :: MVar MovieChannelState -> ServerHandler ()
+    update_movie_download_progress :: SWS MovieChannelState -> ServerHandler ()
     update_movie_download_progress channel_state_var
       -- | Invariant: This is the only thread that uses channel_state_var. This is guaranteed by guarding state on 'RequestingDownload' above.
       --
       -- This invariant allows us to only modify the state when we are finished processing the costly operations (ie. find_download_link), thereby allowing variable to be read by other threads frequently, without long blocked times. Being able to read channel_state_var frequently is important because taking snapshot of the whole state needs also channel_state_vars to be read.
      = do
-      channel_state <- takeMVar channel_state_var
-      case channel_state of
-        (DownloadedMovie url _) -> do
-          pure ()
-        (DownloadingMovie t@(PutIO.Transfer {_tPercentDone = Just 100})) -> do
-          putMVar channel_state_var (FindingDownloadLink t)
-          -- Temporarily releasing the variable so that readers can get a snapshot of the state.
-          find_download_link t >>= \case
-            Right url ->
-              modifyMVar channel_state_var $
-              pure . const ((DownloadedMovie url t), ())
-            Left err -> do
-              modifyMVar channel_state_var $
-                pure . const ((CannotDownloadMovie err), ())
-        (DownloadingMovie t) -> do
-          putMVar channel_state_var channel_state
-          clientEnv <- asks _sePutIOClientEnv
-          PutIO.TransferResponse transfer <-
-            callServantClient clientEnv (PutIO.getTransfer (_tId t))
-          liftIO $ threadDelay (3 * (10 ^ 6))
-          modifyMVar channel_state_var $
-            pure . const ((DownloadingMovie transfer), ())
-          update_movie_download_progress channel_state_var
-        FindingDownloadLink _ ->
-          error
-            "Invariant violated: there shouldn't be any other modifiers to channel_state_var MVar and this is an interim state in a single thread."
+      should_keep_watching <-
+        modifySWS channel_state_var $ \channel_state ->
+          case channel_state of
+            (DownloadedMovie url _) -> do
+              pure (channel_state, False)
+            (DownloadingMovie t@(PutIO.Transfer {_tPercentDone = Just 100})) -> do
+              find_download_link t >>= \case
+                Right url -> pure ((DownloadedMovie url t), False)
+                Left err -> do
+                  pure ((CannotDownloadMovie err), False)
+            (DownloadingMovie t) -> do
+              clientEnv <- asks _sePutIOClientEnv
+              PutIO.TransferResponse transfer <-
+                callServantClient clientEnv (PutIO.getTransfer (_tId t))
+              pure ((DownloadingMovie transfer), True)
+      when should_keep_watching $ do
+        liftIO $ threadDelay (3 * (10 ^ 6))
+        update_movie_download_progress channel_state_var
     find_download_link ::
          Transfer -> ServerHandler (Either FindDownloadLinkError String)
     find_download_link t
@@ -351,9 +338,9 @@ downloadMovieFromChannel movie_name channel channel_state_var = do
               liftIO $ putStrLn $ "Unknown file type: " <> _fFileType
               pure $ First Nothing
 
-findMovieStateVar :: MovieQualifier -> ServerHandler (MVar MovieState)
+findMovieStateVar :: MovieQualifier -> ServerHandler (SWS MovieState)
 findMovieStateVar movie_qualifier@(MovieQualifier {_mqName}) = do
-  movie_states <- asks _seMovieStates >>= readMVar
+  movie_states <- asks _seMovieStates >>= readSWS
   case M.lookup movie_qualifier movie_states of
     Nothing ->
       throw400 $
@@ -362,12 +349,9 @@ findMovieStateVar movie_qualifier@(MovieQualifier {_mqName}) = do
     Just movie_state_var -> pure movie_state_var
 
 findMovieChannel ::
-     T.Text
-  -> T.Text
-  -> MVar MovieState
-  -> ServerHandler (MVar MovieChannelState)
+     T.Text -> T.Text -> SWS MovieState -> ServerHandler (SWS MovieChannelState)
 findMovieChannel name channel_id movie_state_var =
-  readMVar movie_state_var >>= \case
+  readSWS movie_state_var >>= \case
     MSNoChannelsYet ->
       throw400 $
       "Movie " <>
@@ -395,9 +379,9 @@ downloadMovieReq name year channel_id = do
   download_from_channel channel_state_var
   where
     download_from_channel ::
-         MVar MovieChannelState -> ReaderT ServerEnv Handler ()
+         SWS MovieChannelState -> ReaderT ServerEnv Handler ()
     download_from_channel channel_state_var =
-      modifyMVar channel_state_var $ \channel_state ->
+      modifySWS channel_state_var $ \channel_state ->
         case channel_state of
           FoundMovieChannel channel
             -- TODO: Async download movie & switch state to RequestingDownload.
@@ -454,7 +438,7 @@ mkServerEnv api_token = do
   _sePutIOClientEnv <- liftIO $ PutIO.getClientEnv api_token
   _sePutIODownloadDir <- find_download_dir _sePutIOClientEnv
   _seFileListCache <- newMVar Nothing
-  _seMovieStates <- newMVar M.empty
+  _seMovieStates <- newSWS M.empty
   pure ServerEnv {..}
   where
     is_download_dir :: PutIO.File -> Bool

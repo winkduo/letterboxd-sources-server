@@ -54,3 +54,6 @@ executables:
     - containers
     - lifted-async
     - transformers-base
+    - monad-control
+    - stm
+    - unliftio
