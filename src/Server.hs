@@ -69,9 +69,8 @@ downloadDirName = "Letterboxd Sources Download Dir"
 
 data MovieChannelState
   = FoundMovieChannel MovieChannel
-  | RequestingDownload
-  | WatchingDownloadProgress
-  | DownloadingMovie Transfer
+  | RequestingDownload MovieChannel
+  | DownloadingMovie MovieChannel Transfer
   | DownloadedMovie String Transfer
   | CannotDownloadMovie FindDownloadLinkError
 
@@ -83,7 +82,7 @@ data MovieStateSnapshot
 data MovieState
   = MSNoChannelsYet
   | MSUpdatingMovieChannels
-  | MSFoundChannels (M.Map T.Text (SWS MovieChannelState))
+  | MSFoundChannels (M.Map T.Text (StoppableSWS MovieChannelState))
 
 data ServerEnv =
   ServerEnv
@@ -100,7 +99,7 @@ data MovieStateReq =
   deriving (Show, Eq, Generic)
 
 type API
-   = "movie_state" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "year" Integer :> Get '[ JSON] MovieStateSnapshot :<|> "download_movie" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "year" Integer :> QueryParam' '[ Required] "channel_id" T.Text :> Post '[ JSON] ()
+   = "movie_state" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "year" Integer :> Get '[ JSON] MovieStateSnapshot :<|> "download_movie" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "year" Integer :> QueryParam' '[ Required] "channel_id" T.Text :> Post '[ JSON] () :<|> "cancel_download" :> QueryParam' '[ Required] "name" T.Text :> QueryParam' '[ Required] "year" Integer :> QueryParam' '[ Required] "channel_id" T.Text :> Post '[ JSON] ()
 
 type ServerHandler = ReaderT ServerEnv Handler
 
@@ -262,7 +261,10 @@ instance JSON.ToJSON FindDownloadLinkError where
   toJSON = JSON.String . T.pack . show
 
 downloadMovieFromChannel ::
-     T.Text -> MovieChannel -> SWS MovieChannelState -> ServerHandler ()
+     T.Text
+  -> MovieChannel
+  -> StoppableSWS MovieChannelState
+  -> ServerHandler ()
 downloadMovieFromChannel movie_name channel channel_state_var = do
   download_dir <- asks _sePutIODownloadDir
   (exists, movie_download_folder) <-
@@ -272,12 +274,13 @@ downloadMovieFromChannel movie_name channel channel_state_var = do
       transfer <-
         tryToAddTransfer (PutIO._fId movie_download_folder) (_mLink channel)
       modifySWS channel_state_var $ \case
-        RequestingDownload -> do
+        RequestingDownload channel -> do
           void $ async $ do update_movie_download_progress channel_state_var
-          pure (DownloadingMovie transfer, ())
+          pure (DownloadingMovie channel transfer, ())
         other -> pure (other, ())
   where
-    update_movie_download_progress :: SWS MovieChannelState -> ServerHandler ()
+    update_movie_download_progress ::
+         StoppableSWS MovieChannelState -> ServerHandler ()
     update_movie_download_progress channel_state_var
       -- | Invariant: This is the only thread that uses channel_state_var. This is guaranteed by guarding state on 'RequestingDownload' above.
       --
@@ -288,19 +291,22 @@ downloadMovieFromChannel movie_name channel channel_state_var = do
           case channel_state of
             (DownloadedMovie url _) -> do
               pure (channel_state, False)
-            (DownloadingMovie t@(PutIO.Transfer {_tPercentDone = Just 100})) -> do
+            (DownloadingMovie _ t@(PutIO.Transfer {_tPercentDone = Just 100})) -> do
               find_download_link t >>= \case
                 Right url -> pure ((DownloadedMovie url t), False)
                 Left err -> do
                   pure ((CannotDownloadMovie err), False)
-            (DownloadingMovie t) -> do
+            (DownloadingMovie channel t) -> do
               clientEnv <- asks _sePutIOClientEnv
               PutIO.TransferResponse transfer <-
                 callServantClient clientEnv (PutIO.getTransfer (_tId t))
-              pure ((DownloadingMovie transfer), True)
-      when should_keep_watching $ do
-        liftIO $ threadDelay (3 * (10 ^ 6))
-        update_movie_download_progress channel_state_var
+              pure ((DownloadingMovie channel transfer), True)
+      case should_keep_watching of
+        Nothing -> pure () -- This SWS is explicitly canceled.
+        Just False -> pure () -- We no longer need to watch this channel.
+        Just True -> do
+          liftIO $ threadDelay (3 * (10 ^ 6))
+          update_movie_download_progress channel_state_var
     find_download_link ::
          Transfer -> ServerHandler (Either FindDownloadLinkError String)
     find_download_link t
@@ -349,7 +355,10 @@ findMovieStateVar movie_qualifier@(MovieQualifier {_mqName}) = do
     Just movie_state_var -> pure movie_state_var
 
 findMovieChannel ::
-     T.Text -> T.Text -> SWS MovieState -> ServerHandler (SWS MovieChannelState)
+     T.Text
+  -> T.Text
+  -> SWS MovieState
+  -> ServerHandler (StoppableSWS MovieChannelState)
 findMovieChannel name channel_id movie_state_var =
   readSWS movie_state_var >>= \case
     MSNoChannelsYet ->
@@ -371,6 +380,19 @@ findMovieChannel name channel_id movie_state_var =
           " doesn't have a channel with id " <> T.unpack channel_id
         Just channel_state_var -> pure channel_state_var
 
+cancelMovieDownload :: T.Text -> Integer -> T.Text -> ServerHandler ()
+cancelMovieDownload name year channel_id = do
+  clientEnv <- asks _sePutIOClientEnv
+  let movie_qualifier = MovieQualifier name year
+  movie_state_var <- findMovieStateVar movie_qualifier
+  channel_state_var <- findMovieChannel name channel_id movie_state_var
+  readSWS channel_state_var >>= \case
+    DownloadingMovie channel t -> do
+      stopSWS_ channel_state_var (FoundMovieChannel channel)
+      void $
+        callServantClient clientEnv $
+        PutIO.cancelTransfer (PutIO.CancelTransferReq [_tId t])
+
 downloadMovieReq :: T.Text -> Integer -> T.Text -> ServerHandler ()
 downloadMovieReq name year channel_id = do
   let movie_qualifier = MovieQualifier name year
@@ -379,24 +401,24 @@ downloadMovieReq name year channel_id = do
   download_from_channel channel_state_var
   where
     download_from_channel ::
-         SWS MovieChannelState -> ReaderT ServerEnv Handler ()
+         StoppableSWS MovieChannelState -> ReaderT ServerEnv Handler ()
     download_from_channel channel_state_var =
-      modifySWS channel_state_var $ \channel_state ->
+      modifySWS_ channel_state_var $ \channel_state ->
         case channel_state of
           FoundMovieChannel channel
             -- TODO: Async download movie & switch state to RequestingDownload.
            -> do
             async $ downloadMovieFromChannel name channel channel_state_var
-            pure (RequestingDownload, ())
-          RequestingDownload
+            pure (RequestingDownload channel)
+          RequestingDownload _
             -- This channel is already requesting a download so we don't do anything.
-           -> pure (channel_state, ())
-          DownloadingMovie _
+           -> pure channel_state
+          DownloadingMovie _ _
             -- This channel is already downloading the movie so we don't do anything.
-           -> pure (channel_state, ())
+           -> pure channel_state
           DownloadedMovie _ _
             -- This channel has already downloaded the movie so we don't do anything.
-           -> pure (channel_state, ())
+           -> pure channel_state
 
 throw400 :: String -> ServerHandler a
 throw400 message = throwError (err400 {errBody = LBS8.pack message})
@@ -420,7 +442,7 @@ createOrFindFolder parent_folder_id name = do
     Just f -> pure (True, f)
 
 server :: ServerT API ServerHandler
-server = getMovieState :<|> downloadMovieReq
+server = getMovieState :<|> downloadMovieReq :<|> cancelMovieDownload
 
 callServantClient :: ClientEnv -> ClientM a -> ServerHandler a
 callServantClient clientEnv clientM = do

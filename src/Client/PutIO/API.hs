@@ -48,6 +48,21 @@ data AddTransferReq =
 instance ToForm AddTransferReq where
   toForm = genericToForm formOptions
 
+data CancelTransferReq =
+  CancelTransferReq
+    { _ctrTransferIds :: [Integer]
+    }
+  deriving (Show, Eq, Generic)
+
+instance ToForm CancelTransferReq where
+  toForm = genericToForm formOptions
+
+data CancelTransferResponse =
+  CancelTransferResponse
+    { _ctrStatus :: String
+    }
+  deriving (Show, Eq, Generic)
+
 data TransferResponse =
   TransferResponse
     { _trTransfer :: Transfer
@@ -80,8 +95,38 @@ data FileDownloadUrlResponse =
 
 type RequiredQueryParam = QueryParam' '[ Required, Strict]
 
-type PutIOAPI
-   = "transfers" :> Capture "id" Integer :> Get '[ JSON] TransferResponse :<|> "transfers" :> "list" :> Get '[ JSON] TransfersResponse :<|> "transfers" :> "add" :> ReqBody '[ FormUrlEncoded] AddTransferReq :> Post '[ JSON] TransferResponse :<|> "account" :> "info" :> Get '[ JSON] UserInfo :<|> "files" :> "search" :> RequiredQueryParam "query" String :> QueryParam "per_page" Integer :> Get '[ JSON] FilesResponse :<|> "files" :> Capture "id" Integer :> "url" :> Get '[ JSON] FileDownloadUrlResponse :<|> "files" :> "list" :> QueryParam "parent_id" Integer :> QueryParam "file_type" String :> RequiredQueryParam "stream_url" Bool :> RequiredQueryParam "hidden" Bool :> Get '[ JSON] FilesResponse :<|> "files" :> "create-folder" :> ReqBody '[ FormUrlEncoded] CreateFolderReq :> Post '[ JSON] FileResponse
+type GetTransfer
+   = "transfers" :> Capture "id" Integer :> Get '[ JSON] TransferResponse
+
+type ListTransfers = "transfers" :> "list" :> Get '[ JSON] TransfersResponse
+
+type AddTransfer
+   = "transfers" :> "add" :> ReqBody '[ FormUrlEncoded] AddTransferReq :> Post '[ JSON] TransferResponse
+
+type CancelTransfer
+   = "transfers" :> "cancel" :> ReqBody '[ FormUrlEncoded] CancelTransferReq :> Post '[ JSON] CancelTransferResponse
+
+type GetAccountInfo = "account" :> "info" :> Get '[ JSON] UserInfo
+
+type SearchFiles
+   = "files" :> "search" :> RequiredQueryParam "query" String :> QueryParam "per_page" Integer :> Get '[ JSON] FilesResponse
+
+type GetFileDownloadUrl
+   = "files" :> Capture "id" Integer :> "url" :> Get '[ JSON] FileDownloadUrlResponse
+
+type ListFiles
+   = "files" :> "list" :> QueryParam "parent_id" Integer :> QueryParam "file_type" String :> RequiredQueryParam "stream_url" Bool :> RequiredQueryParam "hidden" Bool :> Get '[ JSON] FilesResponse
+
+type CreateFolder
+   = "files" :> "create-folder" :> ReqBody '[ FormUrlEncoded] CreateFolderReq :> Post '[ JSON] FileResponse
+
+type FilesAPI
+   = SearchFiles :<|> GetFileDownloadUrl :<|> ListFiles :<|> CreateFolder
+
+type PutIOAPI = TransfersAPI :<|> GetAccountInfo :<|> FilesAPI
+
+type TransfersAPI
+   = GetTransfer :<|> ListTransfers :<|> AddTransfer :<|> CancelTransfer
 
 type OAuth2Token = T.Text
 
@@ -98,14 +143,19 @@ api = Proxy
 getTransfer :: Integer -> ClientM TransferResponse
 listTransfers :: ClientM TransfersResponse
 addTransfer :: AddTransferReq -> ClientM TransferResponse
+cancelTransfer :: CancelTransferReq -> ClientM CancelTransferResponse
 showProfile :: ClientM UserInfo
 searchFiles :: String -> Maybe Integer -> ClientM FilesResponse
 getFileDownloadUrl :: Integer -> ClientM FileDownloadUrlResponse
 listFiles ::
      Maybe Integer -> Maybe String -> Bool -> Bool -> ClientM FilesResponse
 createFolder :: CreateFolderReq -> ClientM FileResponse
-getTransfer :<|> listTransfers :<|> addTransfer :<|> showProfile :<|> searchFiles :<|> getFileDownloadUrl :<|> listFiles :<|> createFolder =
-  client api
+transfersAPI :<|> showProfile :<|> filesAPI = client api
+
+getTransfer :<|> listTransfers :<|> addTransfer :<|> cancelTransfer =
+  transfersAPI
+
+searchFiles :<|> getFileDownloadUrl :<|> listFiles :<|> createFolder = filesAPI
 
 getClientEnv :: OAuth2Token -> IO ClientEnv
 getClientEnv token = do
@@ -138,6 +188,8 @@ $(JSON.deriveJSON (aesonPrefix snakeCase) ''UserInfo)
 $(JSON.deriveJSON (aesonPrefix snakeCase) ''TransferResponse)
 
 $(JSON.deriveJSON (aesonPrefix snakeCase) ''TransfersResponse)
+
+$(JSON.deriveJSON (aesonPrefix snakeCase) ''CancelTransferResponse)
 
 $(JSON.deriveJSON (aesonPrefix snakeCase) ''TransferWithLink)
 

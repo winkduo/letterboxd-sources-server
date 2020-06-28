@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: add646dd2011b16045f648abf0037f6c9379aad4eff8cb908d6647100114d60d
+-- hash: b18cdd012646791e659729f4dc8b2db929604e0e875953ff1341bcc2109e1da3
 
 name:           letterboxd-sources-server
 version:        0.1.0.0
@@ -35,7 +35,6 @@ executable letterboxd-sources-server-exe
       Client.PutIO.Types
       Client.Util
       Control.Concurrent.SWS
-      Rank3
       Server
       Paths_letterboxd_sources_server
   hs-source-dirs:
